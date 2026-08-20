@@ -9,54 +9,91 @@ const allowedRequestHeaders = new Set([
   "Idempotency-Key",
 ]);
 
-const requestHeaderPolicy = {
+function isProductionSource(filename) {
+  return filename.replaceAll("\\", "/").includes("/src/");
+}
+
+function isAuditedIngressAdapter(filename) {
+  return filename.replaceAll("\\", "/").endsWith("/src/ingress.ts");
+}
+
+function isIdentifier(node, name) {
+  return node.type === "Identifier" && node.name === name;
+}
+
+function isRequestHeaders(node) {
+  return (
+    node.type === "MemberExpression" &&
+    !node.computed &&
+    isIdentifier(node.object, "value") &&
+    isIdentifier(node.property, "headers")
+  );
+}
+
+const requestCapabilityPolicy = {
   meta: {
     type: "problem",
     messages: {
       disallowed:
-        "Only Content-Type, Content-Length, and Idempotency-Key may be read from request.headers.",
-      requestMetadata: "request.cf must not be accessed.",
+        "Only direct get() reads of Content-Type, Content-Length, and Idempotency-Key are allowed on incoming headers.",
+      requestMetadata: "Incoming request metadata must not be accessed.",
+      capability:
+        "Request and Headers capabilities are reserved for src/ingress.ts.",
     },
     schema: [],
   },
   create(context) {
+    const filename = context.filename;
+    const production = isProductionSource(filename);
+    const adapter = isAuditedIngressAdapter(filename);
+    const report = (node, messageId) => context.report({ node, messageId });
     return {
-      MemberExpression(node) {
+      Identifier(node) {
         if (
-          node.object.type === "Identifier" &&
-          node.object.name === "request" &&
-          ((node.computed &&
-            node.property.type === "Literal" &&
-            node.property.value === "cf") ||
-            (!node.computed &&
-              node.property.type === "Identifier" &&
-              node.property.name === "cf"))
+          production &&
+          !adapter &&
+          (node.name === "Request" || node.name === "Headers")
         ) {
-          context.report({ node, messageId: "requestMetadata" });
+          report(node, "capability");
+        }
+      },
+      VariableDeclarator(node) {
+        if (!adapter || node.init === null) return;
+        if (isIdentifier(node.init, "value") || isRequestHeaders(node.init)) {
+          report(node, "requestMetadata");
+        }
+      },
+      MemberExpression(node) {
+        if (!adapter) return;
+        if (isIdentifier(node.object, "value") && node.computed) {
+          report(node, "requestMetadata");
+          return;
+        }
+        if (
+          isIdentifier(node.object, "value") &&
+          !node.computed &&
+          isIdentifier(node.property, "cf")
+        ) {
+          report(node, "requestMetadata");
         }
       },
       CallExpression(node) {
+        if (!adapter) return;
         if (
           node.callee.type !== "MemberExpression" ||
-          node.callee.computed ||
-          node.callee.property.type !== "Identifier" ||
-          node.callee.property.name !== "get" ||
-          node.callee.object.type !== "MemberExpression" ||
-          node.callee.object.computed ||
-          node.callee.object.property.type !== "Identifier" ||
-          node.callee.object.property.name !== "headers" ||
-          node.callee.object.object.type !== "Identifier" ||
-          node.callee.object.object.name !== "request"
+          !isRequestHeaders(node.callee.object)
         ) {
           return;
         }
         const [header] = node.arguments;
         if (
+          node.callee.computed ||
+          !isIdentifier(node.callee.property, "get") ||
           header?.type !== "Literal" ||
           typeof header.value !== "string" ||
           !allowedRequestHeaders.has(header.value)
         ) {
-          context.report({ node, messageId: "disallowed" });
+          report(node, "disallowed");
         }
       },
     };
@@ -73,10 +110,12 @@ export default tseslint.config(
     languageOptions: {
       globals: globals.worker,
     },
-    plugins: { privacy: { rules: { "request-headers": requestHeaderPolicy } } },
+    plugins: {
+      privacy: { rules: { "request-capability": requestCapabilityPolicy } },
+    },
     rules: {
       "no-console": "error",
-      "privacy/request-headers": "error",
+      "privacy/request-capability": "error",
     },
   },
   prettier,

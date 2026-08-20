@@ -250,6 +250,73 @@ describe("GitHub aggregate sink", () => {
     );
   });
 
+  it("keeps a readable 129-atom legacy aggregate losslessly mergeable without allowing new cardinality", async () => {
+    const actionKinds = [
+      "command",
+      "file_read",
+      "file_write",
+      "generation",
+      "llm",
+      "model_call",
+      "reasoning",
+      "research",
+      "review",
+      "search",
+      "subagent",
+      "test",
+      "tool",
+      "verification",
+      "unknown",
+    ];
+    const reasonCodes = [
+      "APPROVED",
+      "BUDGET_REJECTED",
+      "DENY",
+      "DUPLICATE_ACTION",
+      "DUPLICATE_PENDING",
+      "EXPECTED_GAIN_REJECTED",
+      "FUNDED",
+      "MARGINAL_ROI_REJECTED",
+      "OTHER",
+      "PARENT_BUDGET_REJECTED",
+      "RECOMMEND_OVERRIDE",
+      "SHADOW_OVERRIDE",
+      "TARGET_REACHED",
+      "UNSPECIFIED",
+      "not_applicable",
+    ];
+    const atoms = Array.from(
+      { length: MAX_AGGREGATE_ATOMS + 1 },
+      (_, index) => ({
+        ...atom,
+        action_kind: actionKinds[index % actionKinds.length],
+        reason_code: reasonCodes[Math.floor(index / actionKinds.length)],
+      }),
+    );
+    const sink = new GitHubSink(
+      "service-token",
+      async () =>
+        new Response(
+          JSON.stringify({
+            sha: "legacy",
+            content: encoded({ ...envelope, atoms }),
+          }),
+          { status: 200 },
+        ),
+    );
+    const matchingSubmission: CommonsEvidenceEnvelopeV1 = {
+      ...envelope,
+      atoms: [{ ...atom, action_kind: "command", reason_code: "APPROVED" }],
+    };
+
+    const plan = await sink.prepare(matchingSubmission);
+
+    expect(JSON.parse(plan.content).atoms).toHaveLength(
+      MAX_AGGREGATE_ATOMS + 1,
+    );
+    expect(JSON.parse(plan.content).atoms[0].count).toBe(4);
+  });
+
   it("aborts while consuming a stalled GitHub response body", async () => {
     const sink = new GitHubSink(
       "service-token",

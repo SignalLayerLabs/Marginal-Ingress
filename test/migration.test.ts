@@ -38,11 +38,23 @@ class LegacySql {
   }
 }
 
+class LegacyStorage {
+  public transactions = 0;
+
+  public constructor(public readonly sql: LegacySql) {}
+
+  public transactionSync<T>(operation: () => T): T {
+    this.transactions += 1;
+    return operation();
+  }
+}
+
 describe("SQLite idempotency migration", () => {
   it("upgrades the d3c0f26 four-column table once with a pending status default", () => {
     const sql = new LegacySql("CREATE TABLE idempotency (...)", false);
-    migrateIdempotencySchema(sql as never);
-    migrateIdempotencySchema(sql as never);
+    const storage = new LegacyStorage(sql);
+    migrateIdempotencySchema(storage as never);
+    migrateIdempotencySchema(storage as never);
 
     expect(
       sql.statements.filter((statement) => statement.startsWith("ALTER TABLE")),
@@ -58,21 +70,20 @@ describe("SQLite idempotency migration", () => {
       "CREATE TABLE idempotency (... status TEXT CHECK(status IN ('pending', 'uncertain', 'completed')))",
       true,
     );
-    migrateIdempotencySchema(sql as never);
-    migrateIdempotencySchema(sql as never);
+    const storage = new LegacyStorage(sql);
+    migrateIdempotencySchema(storage as never);
+    migrateIdempotencySchema(storage as never);
 
     expect(sql.statements).toEqual(
       expect.arrayContaining([
-        "BEGIN IMMEDIATE",
         expect.stringContaining("CREATE TABLE idempotency_rebuilt"),
         expect.stringContaining("CASE status"),
         "DROP TABLE idempotency",
         "ALTER TABLE idempotency_rebuilt RENAME TO idempotency",
-        "COMMIT",
       ]),
     );
-    expect(
-      sql.statements.filter((statement) => statement === "BEGIN IMMEDIATE"),
-    ).toHaveLength(1);
+    expect(storage.transactions).toBe(1);
+    expect(sql.statements).not.toContain("BEGIN IMMEDIATE");
+    expect(sql.statements).not.toContain("COMMIT");
   });
 });

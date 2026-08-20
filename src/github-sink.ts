@@ -19,6 +19,8 @@ export const MAX_GITHUB_RESPONSE_BYTES = 128 * 1024;
 // far below GitHub's supported 1 MiB Contents API file size.
 export const MAX_AGGREGATE_FILE_BYTES = 48 * 1024;
 export const MAX_AGGREGATE_ATOMS = 128;
+const MAX_LEGACY_AGGREGATE_FILE_BYTES =
+  Math.floor((MAX_GITHUB_RESPONSE_BYTES - 1024) / 4) * 3;
 
 type AggregateDocument = {
   schema_version: "1.0";
@@ -102,7 +104,16 @@ function stableDocument(document: AggregateDocument): string {
   return `${JSON.stringify(document, null, 2)}\n`;
 }
 
-function assertAggregateBounds(
+function aggregateBytes(content: string): number {
+  return new TextEncoder().encode(content).byteLength;
+}
+
+function assertReadableAggregate(content: string): void {
+  if (aggregateBytes(content) > MAX_LEGACY_AGGREGATE_FILE_BYTES)
+    throw new Error("aggregate response capacity exceeded");
+}
+
+function assertForwardAggregateBounds(
   content: string,
   atoms: readonly CommonsEvidenceAtomV1[],
 ): void {
@@ -110,10 +121,7 @@ function assertAggregateBounds(
   if (atoms.length > MAX_AGGREGATE_ATOMS || bytes > MAX_AGGREGATE_FILE_BYTES) {
     throw new Error("aggregate capacity exceeded");
   }
-  const maximumContentsResponse = Math.ceil(bytes / 3) * 4 + 1024;
-  if (maximumContentsResponse > MAX_GITHUB_RESPONSE_BYTES) {
-    throw new Error("aggregate response capacity exceeded");
-  }
+  assertReadableAggregate(content);
 }
 
 async function gitBlobSha(content: string): Promise<string> {
@@ -169,12 +177,19 @@ export class GitHubSink {
       throw new Error("GitHub read failed");
     }
 
+    const legacy = isLegacyAggregate(document);
     const merged = mergeAtoms(document.atoms, envelope.atoms);
     const content = stableDocument({
       ...document,
       atoms: merged,
     });
-    assertAggregateBounds(content, merged);
+    assertReadableAggregate(content);
+    if (legacy) {
+      if (merged.length > document.atoms.length)
+        throw new Error("aggregate capacity exceeded");
+    } else {
+      assertForwardAggregateBounds(content, merged);
+    }
     return {
       descriptor: { target, blobSha: await gitBlobSha(content) },
       ...(currentSha === undefined ? {} : { currentSha }),
@@ -257,7 +272,7 @@ export class GitHubSink {
             model_namespace: parsed.model_namespace,
             atoms,
           });
-          assertAggregateBounds(content, atoms);
+          assertReadableAggregate(content);
           return atoms;
         })(),
       };
@@ -396,4 +411,11 @@ export class GitHubSink {
     }
     return next.toString();
   }
+}
+
+function isLegacyAggregate(document: AggregateDocument): boolean {
+  return (
+    document.atoms.length > MAX_AGGREGATE_ATOMS ||
+    aggregateBytes(stableDocument(document)) > MAX_AGGREGATE_FILE_BYTES
+  );
 }

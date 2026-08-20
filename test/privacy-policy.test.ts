@@ -169,20 +169,77 @@ describe("privacy deployment policy", () => {
   });
 
   it.each([
-    ["Cookie", 'request.headers.get("Cookie")'],
-    ["lowercase content type", 'request.headers.get("content-type")'],
-    ["source IP", 'request.headers.get("CF-Connecting-IP")'],
-    ["dynamic header", "request.headers.get(headerName)"],
-    ["request metadata", "request.cf"],
-    ["console bracket syntax", 'console["log"]("metadata")'],
+    ["Cookie", 'value.headers.get("Cookie")'],
+    ["lowercase content type", 'value.headers.get("content-type")'],
+    ["source IP", 'value.headers.get("CF-Connecting-IP")'],
+    ["dynamic header", "value.headers.get(headerName)"],
+    ["request metadata", "value.cf"],
   ])("rejects %s with AST semantics", async (_name, code) => {
     const lint = new ESLint({
       overrideConfigFile: resolve(root, "eslint.config.js"),
     });
     const [result] = await lint.lintText(
-      `declare const request: Request; declare const headerName: string; ${code}`,
+      `declare const value: Request; declare const headerName: string; ${code}`,
       { filePath: resolve(root, "src/policy-fixture.ts") },
     );
-    expect(result?.messages.length).toBeGreaterThan(0);
+    expect(
+      result?.messages.some(
+        (message) => message.ruleId === "privacy/request-capability",
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    [
+      "an aliased request",
+      'const incoming = value; incoming.headers.get("Cookie")',
+    ],
+    [
+      "destructured headers",
+      'const { headers } = value; headers.get("Cookie")',
+    ],
+    ["a computed getter", 'value.headers["get"]("Cookie")'],
+    ["a non-get header operation", 'value.headers.set("Cookie", "value")'],
+    ["computed request metadata", 'value["cf"]'],
+  ])("rejects adapter-policy bypass through %s", async (_name, code) => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText(
+      `declare const value: Request; ${code}`,
+      { filePath: resolve(root, "src/ingress.ts") },
+    );
+    expect(
+      result?.messages.some(
+        (message) => message.ruleId === "privacy/request-capability",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects Request and Headers capabilities outside the audited adapter", async () => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText(
+      "const request: Request = undefined as never; const headers: Headers = request.headers;",
+      { filePath: resolve(root, "src/handler.ts") },
+    );
+    expect(
+      result?.messages.some(
+        (message) => message.ruleId === "privacy/request-capability",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects bracket console syntax with no-console", async () => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText('console["log"]("metadata")', {
+      filePath: resolve(root, "src/handler.ts"),
+    });
+    expect(
+      result?.messages.some((message) => message.ruleId === "no-console"),
+    ).toBe(true);
   });
 });

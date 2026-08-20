@@ -4,12 +4,10 @@ import {
   type PendingDescriptor,
   type WritePlan,
 } from "./github-sink";
-import {
-  parseEvidenceEnvelope,
-  parseIdempotencyKey,
-  type CommonsEvidenceEnvelopeV1,
-} from "./schema";
+import { type CommonsEvidenceEnvelopeV1 } from "./schema";
 import type { Env } from "./env";
+import { handleIngress } from "./application";
+import { parseIngressRequest } from "./ingress";
 
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -40,21 +38,21 @@ export interface ExpiryScheduler {
 }
 
 export function migrateIdempotencySchema(
-  storage: Pick<SqlStorage, "exec">,
+  storage: Pick<DurableObjectStorage, "sql" | "transactionSync">,
 ): void {
   const schema =
     "digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, target TEXT NOT NULL, blob_sha TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_flight', 'completed'))";
-  storage.exec(`CREATE TABLE IF NOT EXISTS idempotency (${schema})`);
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS idempotency (${schema})`);
   const columns = [
-    ...storage.exec<{ name: string }>("PRAGMA table_info(idempotency)"),
+    ...storage.sql.exec<{ name: string }>("PRAGMA table_info(idempotency)"),
   ];
   if (!columns.some((column) => column.name === "status")) {
-    storage.exec(
+    storage.sql.exec(
       "ALTER TABLE idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_flight', 'completed'))",
     );
     return;
   }
-  const table = storage
+  const table = storage.sql
     .exec<{
       sql: string | null;
     }>(
@@ -62,19 +60,14 @@ export function migrateIdempotencySchema(
     )
     .one();
   if (table?.sql?.includes("'in_flight'") !== true) {
-    storage.exec("BEGIN IMMEDIATE");
-    try {
-      storage.exec(`CREATE TABLE idempotency_rebuilt (${schema})`);
-      storage.exec(
+    storage.transactionSync(() => {
+      storage.sql.exec(`CREATE TABLE idempotency_rebuilt (${schema})`);
+      storage.sql.exec(
         "INSERT INTO idempotency_rebuilt (digest, expires_at, target, blob_sha, status) SELECT digest, expires_at, target, blob_sha, CASE status WHEN 'completed' THEN 'completed' WHEN 'pending' THEN 'pending' ELSE 'in_flight' END FROM idempotency",
       );
-      storage.exec("DROP TABLE idempotency");
-      storage.exec("ALTER TABLE idempotency_rebuilt RENAME TO idempotency");
-      storage.exec("COMMIT");
-    } catch (error) {
-      storage.exec("ROLLBACK");
-      throw error;
-    }
+      storage.sql.exec("DROP TABLE idempotency");
+      storage.sql.exec("ALTER TABLE idempotency_rebuilt RENAME TO idempotency");
+    });
   }
 }
 
@@ -278,32 +271,22 @@ export class EvidenceCoordinator implements DurableObject {
     );
   }
 
-  public async fetch(request: Request): Promise<Response> {
-    return this.handle(request);
+  public async fetch(value: unknown): Promise<Response> {
+    const result = await handleIngress(await parseIngressRequest(value), {
+      submit: (evidence, idempotencyKey) =>
+        this.core.submit(evidence, idempotencyKey),
+    });
+    return json(result.body, result.status);
   }
 
   public async alarm(): Promise<void> {
     await this.core.expire();
   }
-
-  private async handle(request: Request): Promise<Response> {
-    if (request.method !== "POST")
-      return json({ accepted: false, error: "not_found" }, 404);
-    try {
-      const evidence = parseEvidenceEnvelope(await request.json());
-      const idempotencyKey = parseIdempotencyKey(
-        request.headers.get("Idempotency-Key"),
-      );
-      return json(await this.core.submit(evidence, idempotencyKey), 202);
-    } catch {
-      return json({ accepted: false, error: "sink_unavailable" }, 502);
-    }
-  }
 }
 
 class SqliteIdempotencyStore implements IdempotencyStore {
   public constructor(private readonly storage: DurableObjectStorage) {
-    migrateIdempotencySchema(this.storage.sql);
+    migrateIdempotencySchema(this.storage);
   }
 
   public async get(digest: string): Promise<IdempotencyRecord | undefined> {
