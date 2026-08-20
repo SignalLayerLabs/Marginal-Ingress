@@ -105,6 +105,66 @@ describe("GitHub aggregate sink", () => {
     await expect(sink.isApplied(pending)).resolves.toBe(true);
   });
 
+  it("searches every entry in a full first history page before treating it as incomplete", async () => {
+    const pending: PendingDescriptor = {
+      target: "models/openai/gpt-5.6-sol/aggregates.json",
+      blobSha: "a".repeat(40),
+    };
+    const commits = Array.from({ length: 16 }, (_, index) => ({
+      sha: `commit-${index}`,
+    }));
+    const sink = new GitHubSink("service-token", async (input) => {
+      const url = String(input);
+      if (url.includes("/commits?"))
+        return new Response(JSON.stringify(commits));
+      if (url.includes("ref=commit-15")) {
+        return new Response(JSON.stringify({ sha: pending.blobSha }));
+      }
+      return new Response(JSON.stringify({ sha: "b".repeat(40) }));
+    });
+
+    await expect(sink.isApplied(pending)).resolves.toBe(true);
+  });
+
+  it("follows a bounded next page before concluding a pending blob is absent", async () => {
+    const pending: PendingDescriptor = {
+      target: "models/openai/gpt-5.6-sol/aggregates.json",
+      blobSha: "a".repeat(40),
+    };
+    const commits = Array.from({ length: 16 }, (_, index) => ({
+      sha: `commit-${index}`,
+    }));
+    let historyRequests = 0;
+    const sink = new GitHubSink("service-token", async (input) => {
+      const url = String(input);
+      if (url.includes("page=2")) {
+        historyRequests += 1;
+        return new Response(JSON.stringify([]));
+      }
+      if (url.includes("/commits?")) {
+        historyRequests += 1;
+        return new Response(JSON.stringify(commits), {
+          headers: {
+            Link: '<https://api.github.com/repos/SignalLayerLabs/Marginal-Commons/commits?path=models%2Fopenai%2Fgpt-5.6-sol%2Faggregates.json&per_page=16&page=2>; rel="next"',
+          },
+        });
+      }
+      return new Response(JSON.stringify({ sha: "b".repeat(40) }));
+    });
+
+    await expect(sink.isApplied(pending)).resolves.toBe(false);
+    expect(historyRequests).toBe(2);
+  });
+
+  it("aborts while consuming a stalled GitHub response body", async () => {
+    const sink = new GitHubSink(
+      "service-token",
+      async () => new Response(new ReadableStream<Uint8Array>({ start() {} })),
+    );
+
+    await expect(sink.prepare(envelope)).rejects.toThrow();
+  }, 12_000);
+
   it("aborts each GitHub request before the Durable Object lock deadline", async () => {
     const sink = new GitHubSink(
       "service-token",
@@ -117,7 +177,9 @@ describe("GitHub aggregate sink", () => {
     );
 
     const started = Date.now();
-    await expect(sink.prepare(envelope)).rejects.toThrow("aborted");
+    await expect(sink.prepare(envelope)).rejects.toThrow(
+      "GitHub request timed out",
+    );
     expect(Date.now() - started).toBeLessThan(30_000);
     expect(GITHUB_REQUEST_TIMEOUT_MS).toBeLessThan(30_000);
   }, 15_000);

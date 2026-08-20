@@ -151,6 +151,25 @@ describe("Marginal Ingress worker", () => {
     expect(response.status).toBe(400);
   });
 
+  it("rejects an otherwise-valid unsafe model namespace", async () => {
+    const unsafe = structuredClone(validEnvelope) as {
+      model_namespace: string;
+    };
+    unsafe.model_namespace = "openai/gpt-5.6-sol-private";
+    const response = await workerWith().fetch(
+      new Request("https://worker.invalid/v1/evidence", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "h".repeat(32),
+        },
+        body: JSON.stringify(unsafe),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+  });
+
   it("returns only the acknowledgement and never echoes evidence", async () => {
     const canary = structuredClone(validEnvelope) as {
       atoms: Array<Record<string, unknown>>;

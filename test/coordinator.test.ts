@@ -67,6 +67,20 @@ class MemoryStore implements IdempotencyStore {
   }
 }
 
+class AlarmAtomicMemoryStore extends MemoryStore {
+  public alarmAt: number | undefined;
+
+  public async putAndSchedule(record: IdempotencyRecord): Promise<void> {
+    this.records.set(record.digest, record);
+    this.alarmAt = await this.nextExpiry();
+  }
+
+  public async purgeExpiredAndSchedule(now: number): Promise<void> {
+    await this.purgeExpired(now);
+    this.alarmAt = await this.nextExpiry();
+  }
+}
+
 function plan(blobSha = descriptor.blobSha): WritePlan {
   return { descriptor: { ...descriptor, blobSha }, content: "{}" };
 }
@@ -135,6 +149,80 @@ describe("serialized idempotency coordinator", () => {
     expect([...store.records.values()][0]?.descriptor.blobSha).toBe(
       "b".repeat(40),
     );
+  });
+
+  it("reconciles the original pending blob before replanning a conflict", async () => {
+    const store = new MemoryStore();
+    let preparations = 0;
+    const sink = {
+      prepare: async () => {
+        preparations += 1;
+        return plan();
+      },
+      commit: async () => {
+        throw new GitHubConflictError();
+      },
+      isApplied: async () => true,
+    } as unknown as GitHubSink;
+
+    const result = await new CoordinatorCore(store, sink, () => 10).submit(
+      envelope,
+      "z".repeat(32),
+    );
+
+    expect(result).toEqual({ accepted: true, duplicate: false });
+    expect(preparations).toBe(1);
+  });
+
+  it("recognizes an original write that lands after an absence check and retry conflict", async () => {
+    const store = new MemoryStore();
+    let reconciliations = 0;
+    let commits = 0;
+    const sink = {
+      prepare: async () => plan(),
+      commit: async () => {
+        commits += 1;
+        throw new GitHubConflictError();
+      },
+      isApplied: async () => {
+        reconciliations += 1;
+        return reconciliations === 2;
+      },
+    } as unknown as GitHubSink;
+
+    const result = await new CoordinatorCore(store, sink, () => 10).submit(
+      envelope,
+      "w".repeat(32),
+    );
+
+    expect(result).toEqual({ accepted: true, duplicate: false });
+    expect(commits).toBe(2);
+    expect(reconciliations).toBe(2);
+  });
+
+  it("keeps an unknown GitHub write outcome inconclusive instead of replanning it", async () => {
+    const store = new MemoryStore();
+    let preparations = 0;
+    const sink = {
+      prepare: async () => {
+        preparations += 1;
+        return plan();
+      },
+      commit: async () => {
+        throw new Error("connection reset after upload");
+      },
+      isApplied: async () => false,
+    } as unknown as GitHubSink;
+    const coordinator = new CoordinatorCore(store, sink, () => 10);
+
+    await expect(coordinator.submit(envelope, "y".repeat(32))).rejects.toThrow(
+      "connection reset after upload",
+    );
+    await expect(coordinator.submit(envelope, "y".repeat(32))).rejects.toThrow(
+      "inconclusive",
+    );
+
+    expect(preparations).toBe(1);
   });
 
   it("keeps a completed retry duplicate after a later same-model write", async () => {
@@ -261,5 +349,25 @@ describe("serialized idempotency coordinator", () => {
 
     expect(store.records.size).toBe(0);
     expect(scheduled.at).toBeUndefined();
+  });
+
+  it("establishes the expiry alarm before a reset can resume a persisted digest", async () => {
+    const store = new AlarmAtomicMemoryStore();
+    let now = 10;
+    const sink = {
+      prepare: async () => plan(),
+      commit: async () => undefined,
+      isApplied: async () => false,
+    } as unknown as GitHubSink;
+    const firstInstance = new CoordinatorCore(store, sink, () => now);
+
+    await firstInstance.submit(envelope, "r".repeat(32));
+    expect(store.alarmAt).toBe(86_400_010);
+
+    now = 86_400_010;
+    await new CoordinatorCore(store, sink, () => now).expire();
+
+    expect(store.records.size).toBe(0);
+    expect(store.alarmAt).toBeUndefined();
   });
 });

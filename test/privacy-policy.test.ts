@@ -70,6 +70,13 @@ function visit(value: JsonValue): void {
       throw new Error("invocation logs override must be disabled");
     }
   }
+  for (const forbidden of [
+    "logpush",
+    "tail_consumers",
+    "streaming_tail_consumers",
+  ]) {
+    if (forbidden in value) throw new Error(`${forbidden} must be absent`);
+  }
   Object.values(value).forEach(visit);
 }
 
@@ -150,6 +157,13 @@ describe("privacy deployment policy", () => {
       },
       "invocation logs",
     ],
+    ["logpush", { logpush: true }, "logpush"],
+    ["tail consumers", { tail_consumers: ["collector"] }, "tail_consumers"],
+    [
+      "streaming tail consumers",
+      { streaming_tail_consumers: ["collector"] },
+      "streaming_tail_consumers",
+    ],
   ])("rejects an unsafe %s override", (_axis, override, message) => {
     const config = safeConfig();
     config.env = { production: override as JsonObject };
@@ -164,6 +178,8 @@ describe("privacy deployment policy", () => {
       ),
     );
 
-    expect(sources.join("\n")).not.toMatch(/\bconsole\.|request\.cf\b/);
+    expect(sources.join("\n")).not.toMatch(
+      /\bconsole(?:\.|\[|\?)|request\.cf\b|["'](?:Cookie|User-Agent|Referer)["']/,
+    );
   });
 });
