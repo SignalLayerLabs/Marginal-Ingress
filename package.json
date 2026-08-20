@@ -1,0 +1,27 @@
+{
+  "name": "marginal-ingress",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260820.1",
+    "@eslint/js": "9.37.0",
+    "@types/node": "24.0.0",
+    "eslint": "9.37.0",
+    "eslint-config-prettier": "10.1.8",
+    "globals": "16.4.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.2",
+    "typescript-eslint": "8.44.1",
+    "vitest": "4.1.11",
+    "wrangler": "4.124.0"
+  }
+}
