@@ -206,6 +206,11 @@ describe("privacy deployment policy", () => {
       'const incoming = value as Request; incoming.headers.get("Cookie")',
     ],
     ["an optional header chain", 'value?.headers.get("Cookie")'],
+    ["a non-null header chain", 'value!.headers.get("Cookie")'],
+    [
+      "a satisfies header chain",
+      '(value satisfies Request).headers.get("Cookie")',
+    ],
     [
       "an assignment alias",
       'let incoming: Request; incoming = value; incoming.headers.get("Cookie")',
@@ -284,6 +289,25 @@ describe("privacy deployment policy", () => {
     });
     expect(
       result?.messages.some((message) => message.ruleId === "no-console"),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["console alias", "const log = console.log;"],
+    ["console destructuring", "const { log } = console;"],
+    ["globalThis console", "globalThis.console.log();"],
+    ["computed globalThis console", 'globalThis["console"]["log"]();'],
+  ])("rejects %s with the custom console policy", async (_name, code) => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText(code, {
+      filePath: resolve(root, "src/handler.ts"),
+    });
+    expect(
+      result?.messages.some(
+        (message) => message.ruleId === "privacy/request-capability",
+      ),
     ).toBe(true);
   });
 });

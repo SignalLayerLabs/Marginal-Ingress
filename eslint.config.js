@@ -25,6 +25,8 @@ function unwrap(node) {
   if (
     node.type === "TSAsExpression" ||
     node.type === "TSTypeAssertion" ||
+    node.type === "TSNonNullExpression" ||
+    node.type === "TSSatisfiesExpression" ||
     node.type === "ChainExpression"
   ) {
     return unwrap(node.expression);
@@ -68,6 +70,7 @@ const requestCapabilityPolicy = {
       requestMetadata: "Incoming request metadata must not be accessed.",
       capability:
         "Request and Headers capabilities are reserved for src/ingress.ts.",
+      consoleAccess: "Console access is prohibited.",
     },
     schema: [],
   },
@@ -78,6 +81,15 @@ const requestCapabilityPolicy = {
     const report = (node, messageId) => context.report({ node, messageId });
     return {
       Identifier(node) {
+        if (
+          node.name === "console" &&
+          !(
+            node.parent?.type === "MemberExpression" &&
+            node.parent.property === node
+          )
+        ) {
+          report(node, "consoleAccess");
+        }
         if (
           production &&
           !adapter &&
@@ -100,6 +112,9 @@ const requestCapabilityPolicy = {
       },
       MemberExpression(node) {
         const name = memberName(node);
+        if (isIdentifier(node.object, "globalThis") && name === "console") {
+          report(node, "consoleAccess");
+        }
         if (!adapter) {
           if (production && (name === "headers" || name === "cf")) {
             report(node, "capability");
