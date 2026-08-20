@@ -4,9 +4,13 @@ import {
   GITHUB_COMMITTER,
   GITHUB_REQUEST_TIMEOUT_MS,
   GITHUB_REPOSITORY,
+  HISTORY_LIMIT,
+  HISTORY_PAGE_LIMIT,
+  MAX_AGGREGATE_ATOMS,
   GitHubSink,
   type PendingDescriptor,
 } from "../src/github-sink";
+import type { CommonsEvidenceEnvelopeV1 } from "../src/schema";
 
 const atom = {
   record_type: "decision",
@@ -110,14 +114,14 @@ describe("GitHub aggregate sink", () => {
       target: "models/openai/gpt-5.6-sol/aggregates.json",
       blobSha: "a".repeat(40),
     };
-    const commits = Array.from({ length: 16 }, (_, index) => ({
+    const commits = Array.from({ length: HISTORY_LIMIT }, (_, index) => ({
       sha: `commit-${index}`,
     }));
     const sink = new GitHubSink("service-token", async (input) => {
       const url = String(input);
       if (url.includes("/commits?"))
         return new Response(JSON.stringify(commits));
-      if (url.includes("ref=commit-15")) {
+      if (url.includes(`ref=commit-${HISTORY_LIMIT - 1}`)) {
         return new Response(JSON.stringify({ sha: pending.blobSha }));
       }
       return new Response(JSON.stringify({ sha: "b".repeat(40) }));
@@ -126,34 +130,124 @@ describe("GitHub aggregate sink", () => {
     await expect(sink.isApplied(pending)).resolves.toBe(true);
   });
 
-  it("follows a bounded next page before concluding a pending blob is absent", async () => {
+  it("bounds an absent reconciliation below the 50-subrequest plan budget", async () => {
     const pending: PendingDescriptor = {
       target: "models/openai/gpt-5.6-sol/aggregates.json",
       blobSha: "a".repeat(40),
     };
-    const commits = Array.from({ length: 16 }, (_, index) => ({
+    const commits = Array.from({ length: HISTORY_LIMIT }, (_, index) => ({
       sha: `commit-${index}`,
     }));
-    let historyRequests = 0;
+    let requests = 0;
     const sink = new GitHubSink("service-token", async (input) => {
       const url = String(input);
-      if (url.includes("page=2")) {
-        historyRequests += 1;
-        return new Response(JSON.stringify([]));
-      }
       if (url.includes("/commits?")) {
-        historyRequests += 1;
+        requests += 1;
+        const page = url.includes("page=3")
+          ? 3
+          : url.includes("page=2")
+            ? 2
+            : 1;
         return new Response(JSON.stringify(commits), {
-          headers: {
-            Link: '<https://api.github.com/repos/SignalLayerLabs/Marginal-Commons/commits?path=models%2Fopenai%2Fgpt-5.6-sol%2Faggregates.json&per_page=16&page=2>; rel="next"',
-          },
+          headers:
+            page < HISTORY_PAGE_LIMIT
+              ? {
+                  Link: `<https://api.github.com/repos/SignalLayerLabs/Marginal-Commons/commits?path=models%2Fopenai%2Fgpt-5.6-sol%2Faggregates.json&per_page=${HISTORY_LIMIT}&page=${page + 1}>; rel="next"`,
+                }
+              : {},
         });
       }
+      requests += 1;
       return new Response(JSON.stringify({ sha: "b".repeat(40) }));
     });
 
     await expect(sink.isApplied(pending)).resolves.toBe(false);
-    expect(historyRequests).toBe(2);
+    expect(requests).toBe(1 + HISTORY_PAGE_LIMIT * (1 + HISTORY_LIMIT));
+    expect(requests).toBeLessThanOrEqual(50);
+  });
+
+  it("rejects a history page that exceeds the requested bounded page size", async () => {
+    const pending: PendingDescriptor = {
+      target: "models/openai/gpt-5.6-sol/aggregates.json",
+      blobSha: "a".repeat(40),
+    };
+    const sink = new GitHubSink("service-token", async (input) => {
+      if (String(input).includes("/commits?")) {
+        return new Response(
+          JSON.stringify(
+            Array.from({ length: HISTORY_LIMIT + 1 }, (_, index) => ({
+              sha: `too-many-${index}`,
+            })),
+          ),
+        );
+      }
+      return new Response(JSON.stringify({ sha: "b".repeat(40) }));
+    });
+
+    await expect(sink.isApplied(pending)).rejects.toThrow(
+      "exceeds requested limit",
+    );
+  });
+
+  it("caps aggregate cardinality before it can exceed a subsequently readable file", async () => {
+    const actionKinds = [
+      "command",
+      "file_read",
+      "file_write",
+      "generation",
+      "llm",
+      "model_call",
+      "reasoning",
+      "research",
+      "review",
+      "search",
+      "subagent",
+      "test",
+      "tool",
+      "verification",
+      "unknown",
+    ];
+    const reasonCodes = [
+      "APPROVED",
+      "BUDGET_REJECTED",
+      "DENY",
+      "DUPLICATE_ACTION",
+      "DUPLICATE_PENDING",
+      "EXPECTED_GAIN_REJECTED",
+      "FUNDED",
+      "MARGINAL_ROI_REJECTED",
+      "OTHER",
+      "PARENT_BUDGET_REJECTED",
+      "RECOMMEND_OVERRIDE",
+      "SHADOW_OVERRIDE",
+      "TARGET_REACHED",
+      "UNSPECIFIED",
+      "not_applicable",
+    ];
+    const atoms = Array.from({ length: MAX_AGGREGATE_ATOMS }, (_, index) => ({
+      ...atom,
+      action_kind: actionKinds[index % actionKinds.length],
+      reason_code: reasonCodes[Math.floor(index / actionKinds.length)],
+    }));
+    const sink = new GitHubSink(
+      "service-token",
+      async () =>
+        new Response(
+          JSON.stringify({
+            sha: "current",
+            content: encoded({ ...envelope, atoms }),
+          }),
+          { status: 200 },
+        ),
+    );
+    const newAtomEnvelope: CommonsEvidenceEnvelopeV1 = {
+      ...envelope,
+      atoms: [{ ...atom, action_kind: "other", reason_code: "not_applicable" }],
+    };
+
+    await expect(sink.prepare(newAtomEnvelope)).rejects.toThrow(
+      "aggregate capacity exceeded",
+    );
   });
 
   it("aborts while consuming a stalled GitHub response body", async () => {

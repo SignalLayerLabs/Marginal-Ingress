@@ -225,6 +225,91 @@ describe("serialized idempotency coordinator", () => {
     expect(preparations).toBe(1);
   });
 
+  it("fails closed across a reset during dispatch until a delayed original lands", async () => {
+    const store = new MemoryStore();
+    const key = "i".repeat(32);
+    let release: (() => void) | undefined;
+    let started: (() => void) | undefined;
+    const dispatched = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const delayedWrite = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const firstSink = {
+      prepare: async () => plan(),
+      commit: async () => {
+        expect(store.records.get(await idempotencyDigest(key))?.status).toBe(
+          "in_flight",
+        );
+        started?.();
+        await delayedWrite;
+        throw new Error("simulated reset after dispatch");
+      },
+      isApplied: async () => false,
+    } as unknown as GitHubSink;
+    const first = new CoordinatorCore(store, firstSink, () => 10).submit(
+      envelope,
+      key,
+    );
+    await dispatched;
+
+    let recoveryCommits = 0;
+    await expect(
+      new CoordinatorCore(
+        store,
+        {
+          prepare: async () => plan(),
+          commit: async () => {
+            recoveryCommits += 1;
+          },
+          isApplied: async () => false,
+        } as unknown as GitHubSink,
+        () => 10,
+      ).submit(envelope, key),
+    ).rejects.toThrow("inconclusive");
+
+    expect(recoveryCommits).toBe(0);
+    release?.();
+    await expect(first).rejects.toThrow("simulated reset after dispatch");
+    const reconciled = await new CoordinatorCore(
+      store,
+      {
+        prepare: async () => plan(),
+        commit: async () => {
+          recoveryCommits += 1;
+        },
+        isApplied: async () => true,
+      } as unknown as GitHubSink,
+      () => 10,
+    ).submit(envelope, key);
+    expect(reconciled).toEqual({ accepted: true, duplicate: true });
+    expect(recoveryCommits).toBe(0);
+  });
+
+  it("leaves a known second conflict absent as retryable pending work", async () => {
+    const store = new MemoryStore();
+    let commits = 0;
+    const sink = {
+      prepare: async () => plan(),
+      commit: async () => {
+        commits += 1;
+        if (commits < 3) throw new GitHubConflictError();
+      },
+      isApplied: async () => false,
+    } as unknown as GitHubSink;
+    const coordinator = new CoordinatorCore(store, sink, () => 10);
+
+    await expect(coordinator.submit(envelope, "k".repeat(32))).rejects.toThrow(
+      "GitHub conflict",
+    );
+    expect([...store.records.values()][0]?.status).toBe("pending");
+    await expect(coordinator.submit(envelope, "k".repeat(32))).resolves.toEqual(
+      { accepted: true, duplicate: false },
+    );
+    expect(commits).toBe(3);
+  });
+
   it("keeps a completed retry duplicate after a later same-model write", async () => {
     const store = new MemoryStore();
     let commits = 0;

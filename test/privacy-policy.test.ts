@@ -1,8 +1,9 @@
-import { readFile, readdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
+import { ESLint } from "eslint";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -84,18 +85,6 @@ function isObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function sourceFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const nested = await Promise.all(
-    entries.map(async (entry) => {
-      const path = resolve(directory, entry.name);
-      if (entry.isDirectory()) return sourceFiles(path);
-      return entry.isFile() && entry.name.endsWith(".ts") ? [path] : [];
-    }),
-  );
-  return nested.flat();
-}
-
 function safeConfig(): JsonObject {
   return {
     send_metrics: false,
@@ -171,15 +160,29 @@ describe("privacy deployment policy", () => {
     expect(() => expectPrivacyConfiguration(config)).toThrow(message);
   });
 
-  it("scans every production source file for prohibited request-specific logging and metadata access", async () => {
-    const sources = await Promise.all(
-      (await sourceFiles(resolve(root, "src"))).map((file) =>
-        readFile(file, "utf8"),
-      ),
-    );
+  it("uses AST lint policy for every production source file", async () => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const results = await lint.lintFiles([resolve(root, "src/**/*.ts")]);
+    expect(results.flatMap((result) => result.messages)).toEqual([]);
+  });
 
-    expect(sources.join("\n")).not.toMatch(
-      /\bconsole(?:\.|\[|\?)|request\.cf\b|["'](?:Cookie|User-Agent|Referer)["']/,
+  it.each([
+    ["Cookie", 'request.headers.get("Cookie")'],
+    ["lowercase content type", 'request.headers.get("content-type")'],
+    ["source IP", 'request.headers.get("CF-Connecting-IP")'],
+    ["dynamic header", "request.headers.get(headerName)"],
+    ["request metadata", "request.cf"],
+    ["console bracket syntax", 'console["log"]("metadata")'],
+  ])("rejects %s with AST semantics", async (_name, code) => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText(
+      `declare const request: Request; declare const headerName: string; ${code}`,
+      { filePath: resolve(root, "src/policy-fixture.ts") },
     );
+    expect(result?.messages.length).toBeGreaterThan(0);
   });
 });

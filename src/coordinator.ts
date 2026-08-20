@@ -19,7 +19,7 @@ export type IdempotencyRecord = Readonly<{
   digest: string;
   expiresAt: number;
   descriptor: PendingDescriptor;
-  status: "pending" | "uncertain" | "completed";
+  status: "pending" | "in_flight" | "completed";
 }>;
 
 export interface IdempotencyStore {
@@ -42,16 +42,39 @@ export interface ExpiryScheduler {
 export function migrateIdempotencySchema(
   storage: Pick<SqlStorage, "exec">,
 ): void {
-  storage.exec(
-    "CREATE TABLE IF NOT EXISTS idempotency (digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, target TEXT NOT NULL, blob_sha TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'uncertain', 'completed')))",
-  );
+  const schema =
+    "digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, target TEXT NOT NULL, blob_sha TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_flight', 'completed'))";
+  storage.exec(`CREATE TABLE IF NOT EXISTS idempotency (${schema})`);
   const columns = [
     ...storage.exec<{ name: string }>("PRAGMA table_info(idempotency)"),
   ];
   if (!columns.some((column) => column.name === "status")) {
     storage.exec(
-      "ALTER TABLE idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'uncertain', 'completed'))",
+      "ALTER TABLE idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_flight', 'completed'))",
     );
+    return;
+  }
+  const table = storage
+    .exec<{
+      sql: string | null;
+    }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'idempotency'",
+    )
+    .one();
+  if (table?.sql?.includes("'in_flight'") !== true) {
+    storage.exec("BEGIN IMMEDIATE");
+    try {
+      storage.exec(`CREATE TABLE idempotency_rebuilt (${schema})`);
+      storage.exec(
+        "INSERT INTO idempotency_rebuilt (digest, expires_at, target, blob_sha, status) SELECT digest, expires_at, target, blob_sha, CASE status WHEN 'completed' THEN 'completed' WHEN 'pending' THEN 'pending' ELSE 'in_flight' END FROM idempotency",
+      );
+      storage.exec("DROP TABLE idempotency");
+      storage.exec("ALTER TABLE idempotency_rebuilt RENAME TO idempotency");
+      storage.exec("COMMIT");
+    } catch (error) {
+      storage.exec("ROLLBACK");
+      throw error;
+    }
   }
 }
 
@@ -97,7 +120,7 @@ export class CoordinatorCore {
         await this.complete(existing);
         return { accepted: true, duplicate: true };
       }
-      if (existing.status === "uncertain") {
+      if (existing.status === "in_flight") {
         throw new GitHubOutcomeInconclusiveError();
       }
     }
@@ -146,10 +169,11 @@ export class CoordinatorCore {
     let plan = await this.sink.prepare(envelope);
     await this.rememberPlan(digest, expiresAt, plan);
     try {
+      await this.markInFlight(digest, expiresAt, plan);
       await this.sink.commit(plan);
     } catch (error) {
       if (!(error instanceof GitHubConflictError)) {
-        await this.markUncertain(digest, expiresAt, plan);
+        await this.markInFlight(digest, expiresAt, plan);
         throw error;
       }
       if (await this.reconcileConflict(digest, expiresAt, plan)) return;
@@ -157,14 +181,15 @@ export class CoordinatorCore {
       plan = await this.sink.prepare(envelope);
       await this.rememberPlan(digest, expiresAt, plan);
       try {
+        await this.markInFlight(digest, expiresAt, plan);
         await this.sink.commit(plan);
       } catch (retryError) {
         if (retryError instanceof GitHubConflictError) {
           if (await this.reconcileConflict(digest, expiresAt, plan)) return;
-          await this.markUncertain(digest, expiresAt, plan);
-          throw new GitHubOutcomeInconclusiveError();
+          await this.rememberPlan(digest, expiresAt, plan);
+          throw retryError;
         }
-        await this.markUncertain(digest, expiresAt, plan);
+        await this.markInFlight(digest, expiresAt, plan);
         throw retryError;
       }
     }
@@ -211,7 +236,7 @@ export class CoordinatorCore {
     await this.persist({ ...record, status: "completed" });
   }
 
-  private async markUncertain(
+  private async markInFlight(
     digest: string,
     expiresAt: number,
     plan: WritePlan,
@@ -220,7 +245,7 @@ export class CoordinatorCore {
       digest,
       expiresAt,
       descriptor: plan.descriptor,
-      status: "uncertain",
+      status: "in_flight",
     });
   }
 
@@ -289,7 +314,7 @@ class SqliteIdempotencyStore implements IdempotencyStore {
           expires_at: number;
           target: string;
           blob_sha: string;
-          status: "pending" | "uncertain" | "completed";
+          status: "pending" | "in_flight" | "completed";
         }>(
           "SELECT digest, expires_at, target, blob_sha, status FROM idempotency WHERE digest = ?",
           digest,

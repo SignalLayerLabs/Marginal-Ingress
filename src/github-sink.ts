@@ -11,10 +11,14 @@ export const GITHUB_COMMITTER = {
   email: "commons-bot@signallayerlabs.example",
 } as const;
 export const GITHUB_REQUEST_TIMEOUT_MS = 10_000;
-
-const HISTORY_LIMIT = 16;
-const HISTORY_PAGE_LIMIT = 4;
-const MAX_GITHUB_RESPONSE_BYTES = 128 * 1024;
+export const HISTORY_LIMIT = 12;
+export const HISTORY_PAGE_LIMIT = 3;
+export const MAX_GITHUB_RESPONSE_BYTES = 128 * 1024;
+// A 48 KiB JSON file expands to at most 65,536 base64 bytes.  With the
+// Contents response wrapper this remains below the 128 KiB response cap and
+// far below GitHub's supported 1 MiB Contents API file size.
+export const MAX_AGGREGATE_FILE_BYTES = 48 * 1024;
+export const MAX_AGGREGATE_ATOMS = 128;
 
 type AggregateDocument = {
   schema_version: "1.0";
@@ -33,7 +37,11 @@ export type WritePlan = Readonly<{
   content: string;
 }>;
 
-export class GitHubConflictError extends Error {}
+export class GitHubConflictError extends Error {
+  public constructor() {
+    super("GitHub conflict");
+  }
+}
 
 function targetFor(
   modelNamespace: CommonsEvidenceEnvelopeV1["model_namespace"],
@@ -94,6 +102,20 @@ function stableDocument(document: AggregateDocument): string {
   return `${JSON.stringify(document, null, 2)}\n`;
 }
 
+function assertAggregateBounds(
+  content: string,
+  atoms: readonly CommonsEvidenceAtomV1[],
+): void {
+  const bytes = new TextEncoder().encode(content).byteLength;
+  if (atoms.length > MAX_AGGREGATE_ATOMS || bytes > MAX_AGGREGATE_FILE_BYTES) {
+    throw new Error("aggregate capacity exceeded");
+  }
+  const maximumContentsResponse = Math.ceil(bytes / 3) * 4 + 1024;
+  if (maximumContentsResponse > MAX_GITHUB_RESPONSE_BYTES) {
+    throw new Error("aggregate response capacity exceeded");
+  }
+}
+
 async function gitBlobSha(content: string): Promise<string> {
   const body = new TextEncoder().encode(content);
   const header = new TextEncoder().encode(`blob ${body.length}\0`);
@@ -147,10 +169,12 @@ export class GitHubSink {
       throw new Error("GitHub read failed");
     }
 
+    const merged = mergeAtoms(document.atoms, envelope.atoms);
     const content = stableDocument({
       ...document,
-      atoms: mergeAtoms(document.atoms, envelope.atoms),
+      atoms: merged,
     });
+    assertAggregateBounds(content, merged);
     return {
       descriptor: { target, blobSha: await gitBlobSha(content) },
       ...(currentSha === undefined ? {} : { currentSha }),
@@ -198,6 +222,8 @@ export class GitHubSink {
       if (!historyResponse.response.ok)
         throw new Error("GitHub reconciliation failed");
       const commitShas = this.commitShas(historyResponse.body);
+      if (commitShas.length > HISTORY_LIMIT)
+        throw new Error("GitHub history page exceeds requested limit");
       const historicalContents = await Promise.all(
         commitShas.map((commitSha) =>
           this.historicalBlobSha(descriptor.target, commitSha),
@@ -224,7 +250,16 @@ export class GitHubSink {
       return {
         schema_version: parsed.schema_version,
         model_namespace: parsed.model_namespace,
-        atoms: [...parsed.atoms],
+        atoms: (() => {
+          const atoms = [...parsed.atoms];
+          const content = stableDocument({
+            schema_version: parsed.schema_version,
+            model_namespace: parsed.model_namespace,
+            atoms,
+          });
+          assertAggregateBounds(content, atoms);
+          return atoms;
+        })(),
       };
     } catch {
       throw new Error("invalid aggregate document");
