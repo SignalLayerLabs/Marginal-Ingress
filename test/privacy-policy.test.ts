@@ -316,4 +316,24 @@ describe("privacy deployment policy", () => {
       ),
     ).toBe(true);
   });
+
+  it.each([
+    [
+      "dynamic computed property",
+      "const key = 'safe'; const metadata = {}; metadata[key];",
+    ],
+    ["literal computed property", 'const metadata = {}; metadata["safe"];'],
+  ])("rejects %s in production source", async (_name, code) => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText(code, {
+      filePath: resolve(root, "src/handler.ts"),
+    });
+    expect(
+      result?.messages.some(
+        (message) => message.ruleId === "privacy/request-capability",
+      ),
+    ).toBe(true);
+  });
 });

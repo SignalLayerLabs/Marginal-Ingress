@@ -112,6 +112,10 @@ const requestCapabilityPolicy = {
       },
       MemberExpression(node) {
         const name = memberName(node);
+        if (production && node.computed) {
+          report(node, "capability");
+          return;
+        }
         if (name === "console") {
           report(node, "consoleAccess");
         }

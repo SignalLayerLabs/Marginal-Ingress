@@ -404,8 +404,9 @@ export class GitHubSink {
   private nextHistoryUrl(link: string | null): string | undefined {
     if (link === null) return undefined;
     const match = /<([^>]+)>;\s*rel="next"/.exec(link);
-    if (match?.[1] === undefined) return undefined;
-    const next = new URL(match[1]);
+    const nextHref = match?.at(1);
+    if (nextHref === undefined) return undefined;
+    const next = new URL(nextHref);
     const expected = `/repos/${GITHUB_REPOSITORY}/commits`;
     if (
       next.origin !== "https://api.github.com" ||
