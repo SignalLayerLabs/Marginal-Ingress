@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "marginal-ingress",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-20",
+  "send_metrics": false,
+  "dependencies_instrumentation": {
+    "enabled": false,
+  },
+  "observability": {
+    "enabled": false,
+    "head_sampling_rate": 0,
+    "logs": {
+      "invocation_logs": false,
+    },
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COORDINATOR",
+        "class_name": "EvidenceCoordinator",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["EvidenceCoordinator"],
+    },
+  ],
+}
