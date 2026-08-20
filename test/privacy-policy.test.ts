@@ -297,6 +297,12 @@ describe("privacy deployment policy", () => {
     ["console destructuring", "const { log } = console;"],
     ["globalThis console", "globalThis.console.log();"],
     ["computed globalThis console", 'globalThis["console"]["log"]();'],
+    ["root console alias", "const root = globalThis; root.console.log();"],
+    ["self console", "self.console.log();"],
+    [
+      "computed root console",
+      'const root = globalThis; root["console"]["log"]();',
+    ],
   ])("rejects %s with the custom console policy", async (_name, code) => {
     const lint = new ESLint({
       overrideConfigFile: resolve(root, "eslint.config.js"),

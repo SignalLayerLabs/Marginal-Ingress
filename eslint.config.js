@@ -112,7 +112,7 @@ const requestCapabilityPolicy = {
       },
       MemberExpression(node) {
         const name = memberName(node);
-        if (isIdentifier(node.object, "globalThis") && name === "console") {
+        if (name === "console") {
           report(node, "consoleAccess");
         }
         if (!adapter) {
