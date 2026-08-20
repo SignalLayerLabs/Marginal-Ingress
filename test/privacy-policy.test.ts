@@ -7,6 +7,9 @@ import { ESLint } from "eslint";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+// This lint suite is a regression guard for reviewed source, not a sandbox
+// against a malicious contributor using arbitrary Turing-complete obfuscation.
+
 type JsonObject = { [key: string]: JsonValue };
 type JsonValue = boolean | number | string | JsonObject | JsonValue[] | null;
 
@@ -324,6 +327,23 @@ describe("privacy deployment policy", () => {
     ],
     ["literal computed property", 'const metadata = {}; metadata["safe"];'],
   ])("rejects %s in production source", async (_name, code) => {
+    const lint = new ESLint({
+      overrideConfigFile: resolve(root, "eslint.config.js"),
+    });
+    const [result] = await lint.lintText(code, {
+      filePath: resolve(root, "src/handler.ts"),
+    });
+    expect(
+      result?.messages.some(
+        (message) => message.ruleId === "privacy/request-capability",
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["global reflection", "globalThis.Reflect.get({}, 'headers');"],
+    ["Function reflection", "Function('return globalThis')();"],
+  ])("rejects %s identifiers in production source", async (_name, code) => {
     const lint = new ESLint({
       overrideConfigFile: resolve(root, "eslint.config.js"),
     });

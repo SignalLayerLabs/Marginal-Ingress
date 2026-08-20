@@ -8,6 +8,14 @@ const allowedRequestHeaders = new Set([
   "Content-Length",
   "Idempotency-Key",
 ]);
+const forbiddenProductionIdentifiers = new Set([
+  "globalThis",
+  "self",
+  "Reflect",
+  "Function",
+  "eval",
+  "console",
+]);
 
 function isProductionSource(filename) {
   return filename.replaceAll("\\", "/").includes("/src/");
@@ -81,6 +89,10 @@ const requestCapabilityPolicy = {
     const report = (node, messageId) => context.report({ node, messageId });
     return {
       Identifier(node) {
+        if (production && forbiddenProductionIdentifiers.has(node.name)) {
+          report(node, "capability");
+          return;
+        }
         if (
           node.name === "console" &&
           !(
