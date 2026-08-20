@@ -15,10 +15,11 @@ const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
 export type SubmissionResult = Readonly<{ accepted: true; duplicate: boolean }>;
 
-type IdempotencyRecord = Readonly<{
+export type IdempotencyRecord = Readonly<{
   digest: string;
   expiresAt: number;
   descriptor: PendingDescriptor;
+  status: "pending" | "completed";
 }>;
 
 export interface IdempotencyStore {
@@ -26,27 +27,49 @@ export interface IdempotencyStore {
   put(record: IdempotencyRecord): Promise<void>;
   remove(digest: string): Promise<void>;
   purgeExpired(now: number): Promise<void>;
+  nextExpiry(): Promise<number | undefined>;
+}
+
+export interface ExpiryScheduler {
+  schedule(at: number | undefined): Promise<void>;
 }
 
 export class CoordinatorCore {
+  private reconciliationTail: Promise<void> = Promise.resolve();
+
   public constructor(
     private readonly store: IdempotencyStore,
     private readonly sink: GitHubSink,
     private readonly now: () => number = Date.now,
+    private readonly scheduler: ExpiryScheduler = {
+      schedule: async () => undefined,
+    },
   ) {}
 
   public async submit(
     envelope: CommonsEvidenceEnvelopeV1,
     idempotencyKey: string,
   ): Promise<SubmissionResult> {
+    return this.serialize(() =>
+      this.submitSerialized(envelope, idempotencyKey),
+    );
+  }
+
+  private async submitSerialized(
+    envelope: CommonsEvidenceEnvelopeV1,
+    idempotencyKey: string,
+  ): Promise<SubmissionResult> {
     const digest = await digestIdempotencyKey(idempotencyKey);
+    await this.expireNow();
     const now = this.now();
-    await this.store.purgeExpired(now);
     const existing = await this.store.get(digest);
     if (existing !== undefined) {
-      if (await this.sink.isApplied(existing.descriptor))
+      if (existing.status === "completed")
         return { accepted: true, duplicate: true };
-      await this.store.remove(digest);
+      if (await this.sink.isApplied(existing.descriptor)) {
+        await this.complete(existing);
+        return { accepted: true, duplicate: true };
+      }
     }
 
     await this.commitWithOneConflictRetry(
@@ -55,6 +78,29 @@ export class CoordinatorCore {
       now + IDEMPOTENCY_TTL_MS,
     );
     return { accepted: true, duplicate: false };
+  }
+
+  public async expire(): Promise<void> {
+    return this.serialize(() => this.expireNow());
+  }
+
+  private async expireNow(): Promise<void> {
+    await this.store.purgeExpired(this.now());
+    await this.rescheduleExpiry();
+  }
+
+  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.reconciliationTail.catch(() => undefined);
+    let release: () => void = () => undefined;
+    this.reconciliationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private async commitWithOneConflictRetry(
@@ -66,6 +112,12 @@ export class CoordinatorCore {
     await this.rememberPlan(digest, expiresAt, plan);
     try {
       await this.sink.commit(plan);
+      await this.complete({
+        digest,
+        expiresAt,
+        descriptor: plan.descriptor,
+        status: "pending",
+      });
       return;
     } catch (error) {
       if (!(error instanceof GitHubConflictError)) throw error;
@@ -74,6 +126,12 @@ export class CoordinatorCore {
     plan = await this.sink.prepare(envelope);
     await this.rememberPlan(digest, expiresAt, plan);
     await this.sink.commit(plan);
+    await this.complete({
+      digest,
+      expiresAt,
+      descriptor: plan.descriptor,
+      status: "pending",
+    });
   }
 
   private async rememberPlan(
@@ -81,7 +139,22 @@ export class CoordinatorCore {
     expiresAt: number,
     plan: WritePlan,
   ): Promise<void> {
-    await this.store.put({ digest, expiresAt, descriptor: plan.descriptor });
+    await this.store.put({
+      digest,
+      expiresAt,
+      descriptor: plan.descriptor,
+      status: "pending",
+    });
+    await this.rescheduleExpiry();
+  }
+
+  private async complete(record: IdempotencyRecord): Promise<void> {
+    await this.store.put({ ...record, status: "completed" });
+    await this.rescheduleExpiry();
+  }
+
+  private async rescheduleExpiry(): Promise<void> {
+    await this.scheduler.schedule(await this.store.nextExpiry());
   }
 }
 
@@ -95,11 +168,17 @@ export class EvidenceCoordinator implements DurableObject {
     this.core = new CoordinatorCore(
       new SqliteIdempotencyStore(this.ctx.storage),
       new GitHubSink(env.GITHUB_TOKEN),
+      Date.now,
+      new DurableObjectAlarmScheduler(this.ctx.storage),
     );
   }
 
   public async fetch(request: Request): Promise<Response> {
-    return this.ctx.blockConcurrencyWhile(() => this.handle(request));
+    return this.handle(request);
+  }
+
+  public async alarm(): Promise<void> {
+    await this.core.expire();
   }
 
   private async handle(request: Request): Promise<Response> {
@@ -120,7 +199,7 @@ export class EvidenceCoordinator implements DurableObject {
 class SqliteIdempotencyStore implements IdempotencyStore {
   public constructor(private readonly storage: DurableObjectStorage) {
     this.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS idempotency (digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, target TEXT NOT NULL, blob_sha TEXT NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS idempotency (digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, target TEXT NOT NULL, blob_sha TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending', 'completed')))",
     );
   }
 
@@ -132,8 +211,9 @@ class SqliteIdempotencyStore implements IdempotencyStore {
           expires_at: number;
           target: string;
           blob_sha: string;
+          status: "pending" | "completed";
         }>(
-          "SELECT digest, expires_at, target, blob_sha FROM idempotency WHERE digest = ?",
+          "SELECT digest, expires_at, target, blob_sha, status FROM idempotency WHERE digest = ?",
           digest,
         )
         .one(),
@@ -144,17 +224,19 @@ class SqliteIdempotencyStore implements IdempotencyStore {
           digest: row.digest,
           expiresAt: row.expires_at,
           descriptor: { target: row.target, blobSha: row.blob_sha },
+          status: row.status,
         };
   }
 
   public async put(record: IdempotencyRecord): Promise<void> {
     this.storage.transactionSync(() => {
       this.storage.sql.exec(
-        "INSERT OR REPLACE INTO idempotency (digest, expires_at, target, blob_sha) VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO idempotency (digest, expires_at, target, blob_sha, status) VALUES (?, ?, ?, ?, ?)",
         record.digest,
         record.expiresAt,
         record.descriptor.target,
         record.descriptor.blobSha,
+        record.status,
       );
     });
   }
@@ -172,6 +254,29 @@ class SqliteIdempotencyStore implements IdempotencyStore {
         now,
       );
     });
+  }
+
+  public async nextExpiry(): Promise<number | undefined> {
+    const row = this.storage.transactionSync(() =>
+      this.storage.sql
+        .exec<{
+          expires_at: number | null;
+        }>("SELECT MIN(expires_at) AS expires_at FROM idempotency")
+        .one(),
+    );
+    return row === null || row.expires_at === null ? undefined : row.expires_at;
+  }
+}
+
+class DurableObjectAlarmScheduler implements ExpiryScheduler {
+  public constructor(private readonly storage: DurableObjectStorage) {}
+
+  public async schedule(at: number | undefined): Promise<void> {
+    if (at === undefined) {
+      await this.storage.deleteAlarm();
+    } else {
+      await this.storage.setAlarm(at);
+    }
   }
 }
 

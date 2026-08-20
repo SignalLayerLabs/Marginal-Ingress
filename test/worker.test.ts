@@ -104,6 +104,32 @@ describe("Marginal Ingress worker", () => {
     expect(unknownResponse.status).toBe(400);
   });
 
+  it("rejects an oversized streamed body without relying on Content-Length", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(64 * 1024 + 1)));
+        controller.close();
+      },
+    });
+    const response = await workerWith().fetch(
+      new Request("https://worker.invalid/v1/evidence", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "g".repeat(32),
+        },
+        body,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+    );
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({
+      accepted: false,
+      error: "invalid_request",
+    });
+  });
+
   it("rejects an unsafe model and free-text field", async () => {
     const unsafe = structuredClone(validEnvelope) as {
       model_namespace: string;

@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   GITHUB_COMMITTER,
+  GITHUB_REQUEST_TIMEOUT_MS,
   GITHUB_REPOSITORY,
   GitHubSink,
+  type PendingDescriptor,
 } from "../src/github-sink";
 
 const atom = {
@@ -81,4 +83,42 @@ describe("GitHub aggregate sink", () => {
       "invalid aggregate document",
     );
   });
+
+  it("reconciles a crash after a later write by finding the pending blob in bounded history", async () => {
+    const pending: PendingDescriptor = {
+      target: "models/openai/gpt-5.6-sol/aggregates.json",
+      blobSha: "a".repeat(40),
+    };
+    const sink = new GitHubSink("service-token", async (input) => {
+      const url = String(input);
+      if (url.includes("/commits?")) {
+        return new Response(
+          JSON.stringify([{ sha: "commit-before-later-write" }]),
+        );
+      }
+      if (url.includes("ref=commit-before-later-write")) {
+        return new Response(JSON.stringify({ sha: pending.blobSha }));
+      }
+      return new Response(JSON.stringify({ sha: "b".repeat(40) }));
+    });
+
+    await expect(sink.isApplied(pending)).resolves.toBe(true);
+  });
+
+  it("aborts each GitHub request before the Durable Object lock deadline", async () => {
+    const sink = new GitHubSink(
+      "service-token",
+      async (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new Error("aborted")),
+          );
+        }),
+    );
+
+    const started = Date.now();
+    await expect(sink.prepare(envelope)).rejects.toThrow("aborted");
+    expect(Date.now() - started).toBeLessThan(30_000);
+    expect(GITHUB_REQUEST_TIMEOUT_MS).toBeLessThan(30_000);
+  }, 15_000);
 });

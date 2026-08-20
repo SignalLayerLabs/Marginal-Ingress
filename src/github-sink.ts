@@ -10,6 +10,9 @@ export const GITHUB_COMMITTER = {
   name: "Marginal Ingress",
   email: "commons-bot@signallayerlabs.example",
 } as const;
+export const GITHUB_REQUEST_TIMEOUT_MS = 10_000;
+
+const HISTORY_LIMIT = 16;
 
 type AggregateDocument = {
   schema_version: "1.0";
@@ -117,7 +120,7 @@ export class GitHubSink {
     envelope: CommonsEvidenceEnvelopeV1,
   ): Promise<WritePlan> {
     const target = targetFor(envelope.model_namespace);
-    const response = await this.fetcher(this.urlFor(target), {
+    const response = await this.request(this.urlFor(target), {
       headers: this.headers(),
     });
     let currentSha: string | undefined;
@@ -154,7 +157,7 @@ export class GitHubSink {
   }
 
   public async commit(plan: WritePlan): Promise<void> {
-    const response = await this.fetcher(this.urlFor(plan.descriptor.target), {
+    const response = await this.request(this.urlFor(plan.descriptor.target), {
       method: "PUT",
       headers: { ...this.headers(), "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -169,15 +172,58 @@ export class GitHubSink {
   }
 
   public async isApplied(descriptor: PendingDescriptor): Promise<boolean> {
-    const response = await this.fetcher(this.urlFor(descriptor.target), {
+    const response = await this.request(this.urlFor(descriptor.target), {
       headers: this.headers(),
     });
-    if (response.status === 404) return false;
-    if (!response.ok) throw new Error("GitHub reconciliation failed");
-    const contents = (await response.json()) as { sha?: unknown };
-    if (typeof contents.sha !== "string")
-      throw new Error("invalid aggregate document");
-    return contents.sha === descriptor.blobSha;
+    if (response.ok) {
+      const contents = (await response.json()) as { sha?: unknown };
+      if (typeof contents.sha !== "string")
+        throw new Error("invalid aggregate document");
+      if (contents.sha === descriptor.blobSha) return true;
+    } else if (response.status !== 404) {
+      throw new Error("GitHub reconciliation failed");
+    }
+
+    const historyResponse = await this.request(
+      this.historyUrl(descriptor.target),
+      {
+        headers: this.headers(),
+      },
+    );
+    if (!historyResponse.ok) throw new Error("GitHub reconciliation failed");
+    const history = (await historyResponse.json()) as unknown;
+    if (!Array.isArray(history)) throw new Error("invalid GitHub history");
+    if (history.length >= HISTORY_LIMIT) {
+      throw new Error("GitHub reconciliation window is incomplete");
+    }
+    const commitShas = history.map((commit) => {
+      if (
+        typeof commit !== "object" ||
+        commit === null ||
+        !("sha" in commit) ||
+        typeof commit.sha !== "string"
+      ) {
+        throw new Error("invalid GitHub history");
+      }
+      return commit.sha;
+    });
+    const historicalContents = await Promise.all(
+      commitShas.map(async (commitSha) => {
+        const historical = await this.request(
+          this.urlFor(descriptor.target, commitSha),
+          {
+            headers: this.headers(),
+          },
+        );
+        if (historical.status === 404) return undefined;
+        if (!historical.ok) throw new Error("GitHub reconciliation failed");
+        const contents = (await historical.json()) as { sha?: unknown };
+        if (typeof contents.sha !== "string")
+          throw new Error("invalid aggregate document");
+        return contents.sha;
+      }),
+    );
+    return historicalContents.includes(descriptor.blobSha);
   }
 
   private parseDocument(
@@ -206,7 +252,25 @@ export class GitHubSink {
     };
   }
 
-  private urlFor(target: string): string {
-    return `https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${target}`;
+  private async request(input: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      GITHUB_REQUEST_TIMEOUT_MS,
+    );
+    try {
+      return await this.fetcher(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private urlFor(target: string, ref?: string): string {
+    const base = `https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${target}`;
+    return ref === undefined ? base : `${base}?ref=${encodeURIComponent(ref)}`;
+  }
+
+  private historyUrl(target: string): string {
+    return `https://api.github.com/repos/${GITHUB_REPOSITORY}/commits?path=${encodeURIComponent(target)}&per_page=${HISTORY_LIMIT}`;
   }
 }
