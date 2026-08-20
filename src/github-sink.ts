@@ -4,6 +4,7 @@ import {
   type CommonsEvidenceAtomV1,
   type CommonsEvidenceEnvelopeV1,
 } from "./schema";
+import { readGitHubLink } from "./ingress";
 
 export const GITHUB_REPOSITORY = "SignalLayerLabs/Marginal-Commons";
 export const GITHUB_COMMITTER = {
@@ -153,7 +154,7 @@ export class GitHubSink {
   ): Promise<WritePlan> {
     const target = targetFor(envelope.model_namespace);
     const { response, body } = await this.requestJson(this.urlFor(target), {
-      headers: this.headers(),
+      headers: this.githubAuthorization(),
     });
     let currentSha: string | undefined;
     let document = emptyDocument(envelope.model_namespace);
@@ -200,7 +201,10 @@ export class GitHubSink {
   public async commit(plan: WritePlan): Promise<void> {
     const response = await this.request(this.urlFor(plan.descriptor.target), {
       method: "PUT",
-      headers: { ...this.headers(), "Content-Type": "application/json" },
+      headers: {
+        ...this.githubAuthorization(),
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         message: "Update anonymous MARGINAL aggregate",
         content: base64Encode(plan.content),
@@ -214,7 +218,7 @@ export class GitHubSink {
 
   public async isApplied(descriptor: PendingDescriptor): Promise<boolean> {
     const current = await this.requestJson(this.urlFor(descriptor.target), {
-      headers: this.headers(),
+      headers: this.githubAuthorization(),
     });
     if (current.response.ok) {
       const contents = current.body as { sha?: unknown };
@@ -232,7 +236,7 @@ export class GitHubSink {
       page += 1
     ) {
       const historyResponse = await this.requestJson(historyUrl, {
-        headers: this.headers(),
+        headers: this.githubAuthorization(),
       });
       if (!historyResponse.response.ok)
         throw new Error("GitHub reconciliation failed");
@@ -246,7 +250,7 @@ export class GitHubSink {
       );
       if (historicalContents.includes(descriptor.blobSha)) return true;
       historyUrl = this.nextHistoryUrl(
-        historyResponse.response.headers.get("Link"),
+        readGitHubLink(historyResponse.response),
       );
     }
     if (historyUrl !== undefined)
@@ -281,7 +285,7 @@ export class GitHubSink {
     }
   }
 
-  private headers(): HeadersInit {
+  private githubAuthorization(): HeadersInit {
     return {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${this.token}`,
@@ -294,7 +298,7 @@ export class GitHubSink {
     commitSha: string,
   ): Promise<string | undefined> {
     const historical = await this.requestJson(this.urlFor(target, commitSha), {
-      headers: this.headers(),
+      headers: this.githubAuthorization(),
     });
     if (historical.response.status === 404) return undefined;
     if (!historical.response.ok)

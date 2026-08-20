@@ -21,11 +21,40 @@ function isIdentifier(node, name) {
   return node.type === "Identifier" && node.name === name;
 }
 
+function unwrap(node) {
+  if (
+    node.type === "TSAsExpression" ||
+    node.type === "TSTypeAssertion" ||
+    node.type === "ChainExpression"
+  ) {
+    return unwrap(node.expression);
+  }
+  return node;
+}
+
+function isIncomingValue(node) {
+  return isIdentifier(unwrap(node), "value");
+}
+
+function memberName(node) {
+  if (!node.computed && node.property.type === "Identifier")
+    return node.property.name;
+  if (
+    node.computed &&
+    node.property.type === "Literal" &&
+    typeof node.property.value === "string"
+  ) {
+    return node.property.value;
+  }
+  return undefined;
+}
+
 function isRequestHeaders(node) {
   return (
     node.type === "MemberExpression" &&
     !node.computed &&
-    isIdentifier(node.object, "value") &&
+    !node.optional &&
+    isIncomingValue(node.object) &&
     isIdentifier(node.property, "headers")
   );
 }
@@ -59,26 +88,49 @@ const requestCapabilityPolicy = {
       },
       VariableDeclarator(node) {
         if (!adapter || node.init === null) return;
-        if (isIdentifier(node.init, "value") || isRequestHeaders(node.init)) {
+        if (isIncomingValue(node.init) || isRequestHeaders(node.init)) {
+          report(node, "requestMetadata");
+        }
+      },
+      AssignmentExpression(node) {
+        if (!adapter) return;
+        if (isIncomingValue(node.right) || isRequestHeaders(node.right)) {
           report(node, "requestMetadata");
         }
       },
       MemberExpression(node) {
-        if (!adapter) return;
-        if (isIdentifier(node.object, "value") && node.computed) {
+        const name = memberName(node);
+        if (!adapter) {
+          if (production && (name === "headers" || name === "cf")) {
+            report(node, "capability");
+          }
+          return;
+        }
+        if (isIncomingValue(node.object) && (node.computed || node.optional)) {
           report(node, "requestMetadata");
           return;
         }
+        if (isIncomingValue(node.object) && name === "cf") {
+          report(node, "requestMetadata");
+        }
         if (
-          isIdentifier(node.object, "value") &&
-          !node.computed &&
-          isIdentifier(node.property, "cf")
+          isRequestHeaders(node) &&
+          !(
+            node.parent?.type === "MemberExpression" &&
+            node.parent.object === node
+          )
         ) {
           report(node, "requestMetadata");
         }
       },
       CallExpression(node) {
         if (!adapter) return;
+        if (
+          node.arguments.some((argument) => isRequestHeaders(unwrap(argument)))
+        ) {
+          report(node, "requestMetadata");
+          return;
+        }
         if (
           node.callee.type !== "MemberExpression" ||
           !isRequestHeaders(node.callee.object)

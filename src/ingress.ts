@@ -96,6 +96,12 @@ const worker: ExportedHandler<Env> = {
 
 export default worker;
 
+// GitHub pagination is transport metadata, not incoming request metadata. It
+// remains here because the capability policy centralizes all header reads.
+export function readGitHubLink(response: Response): string | null {
+  return response.headers.get("Link");
+}
+
 class BodyTooLargeError extends Error {}
 
 async function readBoundedBody(

@@ -201,6 +201,19 @@ describe("privacy deployment policy", () => {
     ["a computed getter", 'value.headers["get"]("Cookie")'],
     ["a non-get header operation", 'value.headers.set("Cookie", "value")'],
     ["computed request metadata", 'value["cf"]'],
+    [
+      "a Request cast alias",
+      'const incoming = value as Request; incoming.headers.get("Cookie")',
+    ],
+    ["an optional header chain", 'value?.headers.get("Cookie")'],
+    [
+      "an assignment alias",
+      'let incoming: Request; incoming = value; incoming.headers.get("Cookie")',
+    ],
+    [
+      "a destructuring assignment",
+      'let headers: Headers; ({ headers } = value); headers.get("Cookie")',
+    ],
   ])("rejects adapter-policy bypass through %s", async (_name, code) => {
     const lint = new ESLint({
       overrideConfigFile: resolve(root, "eslint.config.js"),
@@ -230,6 +243,37 @@ describe("privacy deployment policy", () => {
       ),
     ).toBe(true);
   });
+
+  it.each([
+    [
+      "structural headers",
+      "const metadata: { headers: { get(): void } } = undefined as never; metadata.headers.get();",
+    ],
+    [
+      "structural cf",
+      "const metadata: { cf: unknown } = undefined as never; metadata.cf;",
+    ],
+    [
+      "Request cast",
+      'const metadata = value as Request; metadata.headers.get("Cookie");',
+    ],
+  ])(
+    "rejects %s access outside the adapter regardless of inferred type",
+    async (_name, code) => {
+      const lint = new ESLint({
+        overrideConfigFile: resolve(root, "eslint.config.js"),
+      });
+      const [result] = await lint.lintText(
+        `declare const value: unknown; ${code}`,
+        { filePath: resolve(root, "src/handler.ts") },
+      );
+      expect(
+        result?.messages.some(
+          (message) => message.ruleId === "privacy/request-capability",
+        ),
+      ).toBe(true);
+    },
+  );
 
   it("rejects bracket console syntax with no-console", async () => {
     const lint = new ESLint({
