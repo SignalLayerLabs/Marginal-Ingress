@@ -290,6 +290,7 @@ export class GitHubSink {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${this.token}`,
       "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "Marginal-Ingress/0.1",
     };
   }
 

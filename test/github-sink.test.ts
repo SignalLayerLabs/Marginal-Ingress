@@ -345,3 +345,18 @@ describe("GitHub aggregate sink", () => {
     expect(GITHUB_REQUEST_TIMEOUT_MS).toBeLessThan(30_000);
   }, 15_000);
 });
+
+it("sends a stable User-Agent on GitHub API requests", async () => {
+  const sink = new GitHubSink("service-token", async (_input, init) => {
+    const headers = new Headers(init?.headers);
+
+    expect(headers.get("User-Agent")).toBe("Marginal-Ingress/0.1");
+
+    return new Response(JSON.stringify({ message: "Not Found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
+  await sink.prepare(envelope);
+});
