@@ -360,3 +360,38 @@ it("sends a stable User-Agent on GitHub API requests", async () => {
 
   await sink.prepare(envelope);
 });
+
+it("calls the fetch capability without binding GitHubSink as receiver", async () => {
+  const receiverSensitiveFetcher = function (
+    this: unknown,
+    _input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    if (this !== undefined) {
+      throw new Error("fetch receiver leaked");
+    }
+
+    if (init?.method === "PUT") {
+      return Promise.resolve(
+        new Response(JSON.stringify({ content: { sha: "written" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+
+    return Promise.resolve(
+      new Response(JSON.stringify({ message: "Not Found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+  } as typeof fetch;
+
+  const sink = new GitHubSink("service-token", receiverSensitiveFetcher);
+
+  const plan = await sink.prepare(envelope);
+  expect(plan.currentSha).toBeUndefined();
+
+  await expect(sink.commit(plan)).resolves.toBeUndefined();
+});
