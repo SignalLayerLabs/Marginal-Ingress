@@ -329,16 +329,16 @@ export class GitHubSink {
     input: string,
     init: RequestInit,
   ): Promise<{ response: Response; body: unknown }> {
+    const fetcher = this.fetcher;
     return this.withDeadline(async (signal) => {
-      const response = await this.fetcher(input, { ...init, signal });
+      const response = await fetcher(input, { ...init, signal });
       return { response, body: await this.readJson(response, signal) };
     });
   }
 
   private async request(input: string, init: RequestInit): Promise<Response> {
-    return this.withDeadline((signal) =>
-      this.fetcher(input, { ...init, signal }),
-    );
+    const fetcher = this.fetcher;
+    return this.withDeadline((signal) => fetcher(input, { ...init, signal }));
   }
 
   private async withDeadline<T>(
