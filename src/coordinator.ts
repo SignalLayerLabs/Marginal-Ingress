@@ -290,21 +290,21 @@ class SqliteIdempotencyStore implements IdempotencyStore {
   }
 
   public async get(digest: string): Promise<IdempotencyRecord | undefined> {
-    const row = this.storage.transactionSync(() =>
-      this.storage.sql
-        .exec<{
-          digest: string;
-          expires_at: number;
-          target: string;
-          blob_sha: string;
-          status: "pending" | "in_flight" | "completed";
-        }>(
-          "SELECT digest, expires_at, target, blob_sha, status FROM idempotency WHERE digest = ?",
-          digest,
-        )
-        .one(),
-    );
-    return row === null
+    const row = this.storage.transactionSync(() => {
+      const rows = this.storage.sql.exec<{
+        digest: string;
+        expires_at: number;
+        target: string;
+        blob_sha: string;
+        status: "pending" | "in_flight" | "completed";
+      }>(
+        "SELECT digest, expires_at, target, blob_sha, status FROM idempotency WHERE digest = ?",
+        digest,
+      );
+      for (const row of rows) return row;
+      return undefined;
+    });
+    return row === undefined
       ? undefined
       : {
           digest: row.digest,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CoordinatorCore,
+  EvidenceCoordinator,
   type IdempotencyRecord,
   type IdempotencyStore,
 } from "../src/coordinator";
@@ -455,4 +456,126 @@ describe("serialized idempotency coordinator", () => {
     expect(store.records.size).toBe(0);
     expect(store.alarmAt).toBeUndefined();
   });
+});
+
+class CloudflareSqlCursor<T> extends Array<T> {
+  public one(): T {
+    if (this.length !== 1) {
+      throw new Error("Expected exactly one result from SQL query");
+    }
+    return this[0]!;
+  }
+}
+
+class EmptyCloudflareSql {
+  private record:
+    | {
+        digest: string;
+        expires_at: number;
+        target: string;
+        blob_sha: string;
+        status: "pending" | "in_flight" | "completed";
+      }
+    | undefined;
+
+  public exec<T>(
+    statement: string,
+    ...bindings: unknown[]
+  ): CloudflareSqlCursor<T> {
+    let rows: unknown[] = [];
+
+    if (statement.startsWith("PRAGMA table_info")) {
+      rows = ["digest", "expires_at", "target", "blob_sha", "status"].map(
+        (name) => ({ name }),
+      );
+    } else if (statement.startsWith("SELECT sql FROM sqlite_master")) {
+      rows = [
+        {
+          sql: "CREATE TABLE idempotency (status CHECK(status IN ('pending', 'in_flight', 'completed')))",
+        },
+      ];
+    } else if (statement.startsWith("SELECT MIN(expires_at)")) {
+      rows = [{ expires_at: this.record?.expires_at ?? null }];
+    } else if (
+      statement.startsWith(
+        "SELECT digest, expires_at, target, blob_sha, status FROM idempotency",
+      )
+    ) {
+      if (this.record !== undefined && this.record.digest === bindings[0]) {
+        rows = [this.record];
+      }
+    } else if (statement.startsWith("INSERT OR REPLACE INTO idempotency")) {
+      this.record = {
+        digest: bindings[0] as string,
+        expires_at: bindings[1] as number,
+        target: bindings[2] as string,
+        blob_sha: bindings[3] as string,
+        status: bindings[4] as "pending" | "in_flight" | "completed",
+      };
+    } else if (
+      statement.startsWith("DELETE FROM idempotency WHERE expires_at")
+    ) {
+      if (
+        this.record !== undefined &&
+        this.record.expires_at <= (bindings[0] as number)
+      ) {
+        this.record = undefined;
+      }
+    }
+
+    return Object.assign(new CloudflareSqlCursor<T>(), rows);
+  }
+}
+
+class EmptyCloudflareStorage {
+  public readonly sql = new EmptyCloudflareSql();
+
+  public transactionSync<T>(operation: () => T): T {
+    return operation();
+  }
+
+  public async setAlarm(): Promise<void> {}
+
+  public async deleteAlarm(): Promise<void> {}
+}
+
+it("accepts the first submission when SQLite has no idempotency row", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "PUT") {
+      return new Response("{}", { status: 201 });
+    }
+
+    return new Response(JSON.stringify({ message: "Not Found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const coordinator = new EvidenceCoordinator(
+      { storage: new EmptyCloudflareStorage() } as never,
+      { GITHUB_TOKEN: "test-token" } as never,
+    );
+
+    const response = await coordinator.fetch(
+      new Request("https://coordinator.invalid/v1/evidence", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "q".repeat(32),
+        },
+        body: JSON.stringify(envelope),
+      }),
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({
+      accepted: true,
+      duplicate: false,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
