@@ -16,6 +16,20 @@ const atom = {
 };
 
 describe("strict evidence parser", () => {
+  it("accepts the exact public Astra namespace", () => {
+    expect(
+      parseEvidenceEnvelope({
+        schema_version: "1.0",
+        model_namespace: "openai/gpt-6-astra",
+        atoms: [atom],
+      }),
+    ).toEqual({
+      schema_version: "1.0",
+      model_namespace: "openai/gpt-6-astra",
+      atoms: [atom],
+    });
+  });
+
   it("returns only the contract fields from a valid aggregate", () => {
     expect(
       parseEvidenceEnvelope({
