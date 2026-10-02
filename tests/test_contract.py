@@ -52,6 +52,10 @@ def test_ingress_envelope_contract_is_closed_and_accepts_a_safe_aggregate() -> N
     _validator().validate(_payload())
 
 
+def test_ingress_envelope_accepts_the_exact_public_astra_namespace() -> None:
+    _validator().validate({**_payload(), "model_namespace": "openai/gpt-6-astra"})
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
